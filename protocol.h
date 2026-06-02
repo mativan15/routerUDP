@@ -19,7 +19,7 @@ using namespace std;
 
 const int PORT = 45000;
 constexpr int DATAGRAM_SIZE = 500;
-constexpr int HEADER_SIZE = 6;
+constexpr int HEADER_SIZE = 7;
 constexpr int PAYLOAD_SIZE = DATAGRAM_SIZE-HEADER_SIZE;
 
 struct Datagram {
@@ -38,6 +38,14 @@ static string intForBuffer(long long value, int width) {
   char buffer[32];
   snprintf(buffer, sizeof(buffer), "%0*lld", width, value);
   return string(buffer, width);
+}
+
+static char checksumMod7(const string &flag, const string &sequence, const string &payload) {
+  int sum = 0;
+  for (unsigned char c : flag) sum += c;
+  for (unsigned char c : sequence) sum += c;
+  for (unsigned char c : payload) sum += c;
+  return (char)('0' + (sum % 7));
 }
 
 static string addrKey(const sockaddr_in &addr) {
@@ -74,6 +82,7 @@ static bool sendDatagram(int SocketFD, const sockaddr_in &to, const string &flag
   memcpy(datagram, flag.data(), 2);
   string seq = intForBuffer(sequence, 4);
   memcpy(datagram + 2, seq.data(), 4);
+  datagram[6] = checksumMod7(flag, seq, payload);
   memcpy(datagram + HEADER_SIZE, payload.data(), PAYLOAD_SIZE);
 
   ssize_t sent = sendto(SocketFD, datagram, DATAGRAM_SIZE, 0,
@@ -82,7 +91,7 @@ static bool sendDatagram(int SocketFD, const sockaddr_in &to, const string &flag
     perror("sendto");
     return false;
   }
-  cout << "Sent datagram -> " << datagram << endl; 
+  cout << "Sent datagram -> " << string(datagram,DATAGRAM_SIZE) << endl; 
   return true;
 }
 
@@ -117,27 +126,35 @@ static bool sendPayload(int SocketFD, const sockaddr_in &to, const string &paylo
 }
 
 static bool recvDatagram(int SocketFD, Datagram &packet) {
-  char buffer[DATAGRAM_SIZE];
-  sockaddr_in from;
-  socklen_t fromLen = sizeof(from);
+  for (;;) {
+    char buffer[DATAGRAM_SIZE];
+    sockaddr_in from;
+    socklen_t fromLen = sizeof(from);
 
-  ssize_t received = recvfrom(SocketFD, buffer, DATAGRAM_SIZE, 0,
-                              (struct sockaddr *)&from, &fromLen);
-  if (received <= 0) {
-    perror("recvfrom");
-    return false;
-  }
-  if (received != DATAGRAM_SIZE) {
-    cerr << "Invalid datagram size: " << received << endl;
-    return false;
-  }
+    ssize_t received = recvfrom(SocketFD, buffer, DATAGRAM_SIZE, 0, (struct sockaddr *)&from, &fromLen);
+    if (received <= 0) {
+      perror("recvfrom");
+      return false;
+    }
+    if (received != DATAGRAM_SIZE) {
+      cerr << "Invalid datagram size: " << received << endl;
+      continue;
+    }
 
-  packet.flag = string(buffer, 2);
-  packet.sequence = atoi(string(buffer + 2, 4).c_str());
-  packet.payload = string(buffer + HEADER_SIZE, PAYLOAD_SIZE);
-  packet.from = from;
-  cout << "Received datagram <- " << packet.payload << endl;
-  return true;
+    packet.flag = string(buffer, 2);
+    string seq = string(buffer + 2, 4);
+    packet.sequence = atoi(seq.c_str());
+    packet.payload = string(buffer + HEADER_SIZE, PAYLOAD_SIZE);
+    packet.from = from;
+    char checksum = buffer[6];
+    char expected = checksumMod7(packet.flag, seq, packet.payload);
+    if (checksum != expected) {
+      cerr << "Invalid datagram checksum: got " << checksum << ", expected " << expected << endl;
+      continue;
+    }
+    cout << "Received datagram <- " << packet.payload << endl;
+    return true;
+  }
 }
 
 static string recvPayloadFrom(int SocketFD, sockaddr_in &from) {
@@ -168,6 +185,19 @@ static string recvPayloadFrom(int SocketFD, sockaddr_in &from) {
            [](const Fragment &a, const Fragment &b) {
              return a.sequence < b.sequence;
            });
+
+      bool complete = true;
+      for (size_t i = 0; i < fragments.size(); ++i) {
+        if (fragments[i].sequence != (int)i) {
+          complete = false;
+          break;
+        }
+      }
+      if (!complete) {
+        cerr << "Missing datagram fragment before final datagram" << endl;
+        fragments.clear();
+        continue;
+      }
 
       string fullPayload;
       for (const Fragment &fragment : fragments) {

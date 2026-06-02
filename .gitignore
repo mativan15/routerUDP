@@ -5,3 +5,6 @@
 /install.log
 /install2.log
 /koala.webp
+/.DS_Store
+/client
+/server
